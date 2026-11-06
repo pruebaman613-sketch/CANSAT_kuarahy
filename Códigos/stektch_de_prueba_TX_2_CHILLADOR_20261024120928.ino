@@ -1,4 +1,4 @@
-const int orden= 0;
+const int CHICHARRA = 4;
 float altitud = 0; 
 
 void setup() {
@@ -6,7 +6,7 @@ void setup() {
 }
 
 void loop() {
-  if (orden = 3) {
+  if (altitud < 5) {
     digitalWrite(CHICHARRA, HIGH);
   } else {
     digitalWrite(CHICHARRA, LOW);
