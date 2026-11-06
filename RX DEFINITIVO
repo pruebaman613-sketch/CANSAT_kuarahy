@@ -1,0 +1,229 @@
+/*
+  Estacion terrena - Heltec WiFi LoRa 32 V3.
+  Dependencias: RadioLib 7.2.1 y biblioteca Heltec ESP32 con
+  HT_SSD1306Wire.h (la misma utilizada en el programa original).
+  Monitor serie 115200. Cargar CanSat_Vuelo.ino en el CanSat.
+
+
+  Switch servo: GPIO4 a GND; cerrado=abrir servo/activar camara.
+  Switch buzzer: GPIO5 a GND; cerrado=forzar sonido; abierto=automatico.
+  Si no existe segundo switch, dejar GPIO5 sin conectar.
+  OLED SDA17 SCL18 RST21 Vext36; LED integrado GPIO35.
+
+
+  La base espera T, transmite C 35 ms despues y acepta solo A que coincida
+  con equipo, arranque del CanSat, sesion y secuencia pendientes.
+  Reintenta una vez por telemetria, maximo 5 intentos. R vuelve a intentar.
+  Un reinicio del CanSat invalida la confirmacion y sincroniza los switches.
+  Una orden confirmada no se repite; el automatismo de apogeo puede actuar.
+  ACK confirma aplicacion de software. No hay sensor de posicion del servo
+  ni retorno desde la ESP32-CAM. Protocolo sin autenticacion ni cifrado.
+
+
+  Consola: 0 cerrar, 1 abrir, B automatico, b forzar buzzer, R reintentar.
+  Los cambios fisicos posteriores de los switches reemplazan estas ordenes.
+  Guardar la salida serie para registrar telemetria (no hay SD en el esquema).
+*/
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>
+#include "HT_SSD1306Wire.h"
+#include <esp_system.h>
+#include <math.h>
+
+
+constexpr unsigned EQUIPO=26;
+constexpr uint32_t SIN_ENLACE_MS=6000, ESPERA_ACK_MS=650;
+constexpr uint8_t MAX_INTENTOS=5;
+SX1262 radio=new Module(8,14,12,13);
+SSD1306Wire oled(0x3C,500000,17,18,GEOMETRY_128_64,21);
+volatile bool rxPendiente=false;
+bool radioOK=false, hayTelemetria=false, sensorValido=false, armado=false;
+bool deseadoServo=false,deseadoBuzzer=false;
+int ordenVuelo=-1; // -1 conserva el estado; 0 desarma; 1 arma
+int realServo=0,realBuzzer=0;
+bool pendiente=true, confirmado=false, esperandoACK=false, envioProgramado=false;
+uint8_t intentos=0;
+uint32_t sesion=0, arranqueCanSat=0, secuencia=1, ultimoPaquete=0;
+uint32_t ultimaT=0, enviarEn=0, enviadoEn=0, ultimaPantalla=0, ultimoIntentoRadio=0;
+uint32_t perdidos=0;
+float temperatura=NAN,presion=NAN,altura=NAN,pico=NAN,rssi=NAN;
+
+
+// Arrays simples para evitar dependencias del autogenerador de prototipos Arduino.
+const uint8_t pinesSwitch[2]={4,5};
+bool estable[2]={HIGH,HIGH}, ultimo[2]={HIGH,HIGH};
+uint32_t cambio[2]={0,0};
+
+
+void IRAM_ATTR alRecibir() { rxPendiente=true; }
+
+
+void escuchar() {
+  rxPendiente=false; radio.setDio1Action(alRecibir);
+  int estado=radio.startReceive();
+  if(estado!=RADIOLIB_ERR_NONE) { radioOK=false; Serial.printf("RX ERROR %d\n",estado); }
+}
+
+
+void iniciarRadio() {
+  ultimoIntentoRadio=millis(); radio.clearDio1Action();
+  SPI.begin(9,11,10,8);
+  int estado=radio.begin(915.0,125.0,7,5,0xF3,17,8,1.8);
+  if(estado==RADIOLIB_ERR_NONE) estado=radio.setCRC(true);
+  radioOK=estado==RADIOLIB_ERR_NONE;
+  Serial.printf("RADIO inicio: %d\n",estado);
+  if(radioOK) escuchar();
+}
+
+
+void nuevaOrden() {
+  secuencia++; if(secuencia==0) { sesion=esp_random(); secuencia=1; }
+  pendiente=true; confirmado=false; esperandoACK=false;
+  envioProgramado=false; intentos=0;
+  Serial.printf("ORDEN pendiente #%lu servo=%d buzzer=%d\n",
+    (unsigned long)secuencia,deseadoServo,deseadoBuzzer,ordenVuelo);
+}
+
+
+void switches() {
+  for(int i=0;i<2;i++) {
+    bool lectura=digitalRead(pinesSwitch[i]);
+    if(lectura!=ultimo[i]) { ultimo[i]=lectura; cambio[i]=millis(); }
+    if(millis()-cambio[i]>=40 && estable[i]!=lectura) {
+      estable[i]=lectura;
+      if(i==0) deseadoServo=lectura==LOW; else deseadoBuzzer=lectura==LOW;
+      nuevaOrden();
+    }
+  }
+}
+
+
+void enviarOrden() {
+  envioProgramado=false;
+  char texto[130];
+  if(!pendiente || intentos>=MAX_INTENTOS) {
+    // Acuse de telemetria: confirma al CanSat que T llego a la base.
+    snprintf(texto,sizeof(texto),"H,1,%u,%lu,%lu",EQUIPO,
+      (unsigned long)arranqueCanSat,(unsigned long)ultimoPaquete);
+    radio.clearDio1Action(); rxPendiente=false;
+    int estado=radio.transmit(String(texto)); escuchar();
+    if(estado!=RADIOLIB_ERR_NONE) Serial.printf("TX H ERROR %d\n",estado);
+    return;
+  }
+  snprintf(texto,sizeof(texto),"C,1,%u,%lu,%lu,%lu,%d,%d,%d",EQUIPO,
+    (unsigned long)arranqueCanSat,(unsigned long)sesion,
+    (unsigned long)secuencia,deseadoServo,deseadoBuzzer,ordenVuelo);
+  radio.clearDio1Action(); rxPendiente=false;
+  int estado=radio.transmit(String(texto));
+  escuchar(); intentos++; enviadoEn=millis();
+  esperandoACK=estado==RADIOLIB_ERR_NONE;
+  Serial.printf("TX ORDEN #%lu intento %u/%u resultado=%d; esperando ACK\n",
+    (unsigned long)secuencia,intentos,MAX_INTENTOS,estado);
+}
+
+
+void recibir() {
+  rxPendiente=false;
+  String mensaje;
+  int estado=radio.readData(mensaje);
+  float nivel=radio.getRSSI();
+  escuchar();
+  if(estado!=RADIOLIB_ERR_NONE) { Serial.printf("RX ERROR %d\n",estado); return; }
+  unsigned version,id;
+  unsigned long boot,num,ses,seq;
+  int ok,s,b,f,n=0;
+  float t,p,h,maximo;
+  int campos=sscanf(mensaje.c_str(),"T,%u,%u,%lu,%lu,%d,%f,%f,%f,%f,%d,%d,%d%n",
+    &version,&id,&boot,&num,&ok,&t,&p,&h,&maximo,&s,&b,&f,&n);
+  if(campos==12 && n==(int)mensaje.length() && version==1 && id==EQUIPO &&
+     (ok==0 || ok==1) && (s==0 || s==1) && (b==0 || b==1) && (f==0 || f==1) &&
+     (!ok || (isfinite(t) && isfinite(p) && isfinite(h) && isfinite(maximo)))) {
+    if(!hayTelemetria || boot!=arranqueCanSat) {
+      arranqueCanSat=boot; ultimoPaquete=0; perdidos=0; nuevaOrden();
+      Serial.println("CANSAT detectado/reiniciado; sincronizando estados");
+    }
+    if(ultimoPaquete!=0 && num>ultimoPaquete) perdidos+=num-ultimoPaquete-1;
+    ultimoPaquete=num; ultimaT=millis(); hayTelemetria=true;
+    temperatura=t; presion=p; altura=h; pico=maximo;
+    sensorValido=ok; realServo=s; realBuzzer=b; armado=f; rssi=nivel;
+    Serial.println(mensaje);
+    Serial.printf("RSSI %.0f dBm; perdidos estimados=%lu\n",rssi,(unsigned long)perdidos);
+    // Solo enviar como respuesta a T: evita competir con su transmision.
+    enviarEn=millis()+35; envioProgramado=true;
+    return;
+  }
+  n=0;
+  campos=sscanf(mensaje.c_str(),"A,%u,%u,%lu,%lu,%lu,%d,%d%n",
+    &version,&id,&boot,&ses,&seq,&s,&b,&n);
+  if(campos==7 && n==(int)mensaje.length() && version==1 && id==EQUIPO &&
+     hayTelemetria && boot==arranqueCanSat && ses==sesion && seq==secuencia &&
+     (s==0 || s==1) && (b==0 || b==1) && pendiente && intentos>0) {
+    // El estado actual puede diferir de la orden por un apogeo entre intentos.
+    realServo=s; realBuzzer=b;
+    pendiente=false; confirmado=true; esperandoACK=false; envioProgramado=false;
+    ordenVuelo=-1;
+    Serial.printf("ACK CONFIRMADO #%lu; servo actual=%d buzzer=%d\n",seq,s,b);
+  }
+}
+
+
+void pantalla() {
+  if(millis()-ultimaPantalla<250) return;
+  ultimaPantalla=millis();
+  bool enlace=hayTelemetria && millis()-ultimaT<SIN_ENLACE_MS;
+  digitalWrite(35,enlace);
+  oled.clear(); oled.setFont(ArialMT_Plain_10); oled.setTextAlignment(TEXT_ALIGN_LEFT);
+  oled.drawString(0,0,!radioOK ? "ERROR RADIO" : (enlace ? "CANSAT ENLAZADO" : "SIN TELEMETRIA"));
+  if(sensorValido) {
+    oled.drawString(0,11,String(temperatura,1)+" C  "+String(presion,1)+" hPa");
+    oled.drawString(0,22,"H "+String(altura,1)+"m  Pico "+String(pico,1));
+  } else oled.drawString(0,14,"BMP sin dato / calibrando");
+  oled.drawString(0,33,"Servo "+String(realServo ? "ABIERTO" : "CERRADO")+(armado ? "  VUELO" : "  BANCO"));
+  String estado=confirmado ? "ACK recibido" : (intentos>=MAX_INTENTOS && !esperandoACK ? "SIN ACK: R reintenta" : "Orden pendiente "+String(intentos)+"/5");
+  oled.drawString(0,44,estado);
+  oled.drawString(0,54,"#"+String(ultimoPaquete)+" RSSI "+String(rssi,0));
+  oled.display();
+}
+
+
+void consola() {
+  while(Serial.available()) {
+    char c=Serial.read();
+    if(c=='0' || c=='1') { deseadoServo=c=='1'; nuevaOrden(); }
+    if(c=='b' || c=='B') { deseadoBuzzer=c=='b'; nuevaOrden(); }
+    if(c=='F' || c=='D') { ordenVuelo=(c=='F') ? 1 : 0; nuevaOrden(); }
+    if(c=='R') nuevaOrden();
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200); delay(500); sesion=esp_random();
+  pinMode(36,OUTPUT); digitalWrite(36,LOW); delay(100);
+  oled.init(); pinMode(35,OUTPUT);
+  for(int i=0;i<2;i++) {
+    pinMode(pinesSwitch[i],INPUT_PULLUP);
+    estable[i]=ultimo[i]=digitalRead(pinesSwitch[i]);
+  }
+  deseadoServo=estable[0]==LOW; deseadoBuzzer=estable[1]==LOW;
+  iniciarRadio();
+  Serial.println("BASE LISTA: esperando T; 0/1 servo, b/B buzzer, R reintentar");
+}
+
+
+void loop() {
+  if(radioOK && rxPendiente) recibir();
+  switches(); consola();
+  if(esperandoACK && millis()-enviadoEn>=ESPERA_ACK_MS) {
+    esperandoACK=false;
+    Serial.println(intentos>=MAX_INTENTOS ? "SIN ACK: agotados 5 intentos; R para reintentar" : "ACK ausente; reintento en siguiente T");
+  }
+  if(envioProgramado && radioOK && (int32_t)(millis()-enviarEn)>=0) enviarOrden();
+  if(!radioOK && millis()-ultimoIntentoRadio>=5000) iniciarRadio();
+  pantalla(); delay(1);
+}
+
+
+
