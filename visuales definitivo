@@ -1,0 +1,638 @@
+import csv
+import os
+import re
+import tempfile
+import time
+import threading
+import queue
+from collections import deque
+from datetime import datetime
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.animation import FuncAnimation
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+from matplotlib.widgets import Button, TextBox
+from matplotlib.patches import Circle
+
+
+
+
+# -----------------------------------------------------------------------------
+# CONFIGURACIN
+# -----------------------------------------------------------------------------
+
+
+MODO_DATOS = "serial"       # "serial" o "simulacion"
+SERIAL_PORT = "COM9"
+BAUD_RATE = 115200
+RECONNECT_DELAY_S = 2.0
+MAX_PUNTOS = 150
+ARCHIVO_CSV = "telemetria_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".csv"
+# Altitud conocida del lugar de encendido. None: no se estima la altitud sobre el mar.
+ALTITUD_LUGAR_M = None
+serial_activo = None
+serial_lock = threading.Lock()
+ARCHIVO_SERIE = ARCHIVO_CSV.replace(".csv", "_serie.txt")
+ultimo_estado = None
+instante_ultimo_dato = None
+COLUMNAS_CSV = [
+    "tiempo", "version", "equipo", "arranque", "pkt",
+    "sensor_valido", "temperatura_C", "presion_hPa",
+    "altitud_m", "altitud_relativa_m", "altitud_nivel_mar_estimada_m", "pico_m",
+    "servo", "buzzer", "vuelo",
+]
+INTERVALO_MS = 300
+ALTITUD_DE_DESPEGUE_M = 1.0
+TIEMPO_SIN_TELEMETRIA_S = 6.0
+DURACION_PULSO_AZUL_S = 0.8
+
+
+PATRON_TELEMETRIA = re.compile(
+    r"^T,"
+    r"(?P<version>\d+),(?P<equipo>\d+),"
+    r"(?P<arranque>\d+),(?P<pkt>\d+),(?P<valido>[01]),"
+    r"(?P<temperatura>-?\d+(?:\.\d+)?),"
+    r"(?P<presion>-?\d+(?:\.\d+)?),"
+    r"(?P<altitud>-?\d+(?:\.\d+)?),"
+    r"(?P<pico>-?\d+(?:\.\d+)?),"
+    r"(?P<servo>[01]),(?P<zumbador>[01]),(?P<vuelo>[01])$"
+)
+
+
+COLOR_FONDO = "#F4F6FA"
+COLOR_TEXTO = "#172033"
+COLOR_SECUNDARIO = "#667085"
+COLOR_PANEL = "#111827"
+COLOR_BORDE = "#D8DEE9"
+COLOR_VERDE = "#21A366"
+COLOR_ROJO = "#E5484D"
+COLOR_AZUL = "#2F80ED"
+COLOR_NARANJA = "#F2994A"
+
+
+tiempos = deque(maxlen=MAX_PUNTOS)
+temperaturas = deque(maxlen=MAX_PUNTOS)
+presiones = deque(maxlen=MAX_PUNTOS)
+altitudes_relativas = deque(maxlen=MAX_PUNTOS)
+altitudes = deque(maxlen=MAX_PUNTOS)
+historico = []
+archivo_csv_lock = threading.Lock()
+cola_datos = queue.Queue()
+
+
+altitud_inicial = None
+ultimo_arranque = None
+inicio_contador_local = None
+inicio_despegue_local = None
+estado_conexion = {"conectado": False, "ultimo_error": None}
+ultimo_paquete_telemetria = None
+
+
+
+
+def convertir_linea(linea):
+    """Convierte una línea T de la estación terrena en un dato válido."""
+    match = PATRON_TELEMETRIA.match(linea.strip())
+    if match is None:
+        return None
+    try:
+        datos = match.groupdict()
+        if datos["valido"] != "1":
+            return None
+        dato = {
+            "tiempo": datetime.now(),
+            "version": int(datos["version"]),
+            "equipo": int(datos["equipo"]),
+            "arranque": int(datos["arranque"]),
+            "pkt": int(datos["pkt"]),
+            "sensor_valido": int(datos["valido"]),
+            "temperatura_C": float(datos["temperatura"]),
+            "presion_hPa": float(datos["presion"]),
+            "altitud_m": float(datos["altitud"]),
+            "pico_m": float(datos["pico"]),
+            "servo": int(datos["servo"]),
+            "buzzer": int(datos["zumbador"]),
+            "vuelo": int(datos["vuelo"]),
+        }
+        if dato["presion_hPa"] <= 0 or not all(
+            np.isfinite(dato[nombre])
+            for nombre in ("temperatura_C", "presion_hPa", "altitud_m")
+        ):
+            return None
+        return dato
+    except (ValueError, TypeError):
+        return None
+
+
+
+
+def hilo_lectura_serial():
+    import serial
+    global serial_activo
+
+
+    ser = None
+    while True:
+        if ser is None:
+            try:
+                print(f"[Serial] Conectando a {SERIAL_PORT} @ {BAUD_RATE}...")
+                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+                with serial_lock:
+                    serial_activo = ser
+                estado_conexion["conectado"] = True
+                estado_conexion["ultimo_error"] = None
+                time.sleep(2)
+                ser.reset_input_buffer()
+                print("[Serial] Conectado correctamente")
+            except serial.SerialException as error:
+                estado_conexion["conectado"] = False
+                estado_conexion["ultimo_error"] = str(error)
+                print(f"[Serial] No se pudo abrir {SERIAL_PORT}: {error}")
+                time.sleep(RECONNECT_DELAY_S)
+                continue
+
+
+        try:
+            linea = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not linea:
+                continue
+            with open(ARCHIVO_SERIE, "a", encoding="utf-8") as registro_serie:
+                registro_serie.write(datetime.now().isoformat(timespec="milliseconds") + " " + linea + "\n")
+            dato = convertir_linea(linea)
+            if dato is None:
+                print("[Estación]", linea)
+            if dato is not None:
+                cola_datos.put(dato)
+        except serial.SerialException as error:
+            print(f"[Serial] Conexión perdida: {error}")
+            estado_conexion["conectado"] = False
+            estado_conexion["ultimo_error"] = str(error)
+            with serial_lock:
+                serial_activo = None
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser = None
+            time.sleep(RECONNECT_DELAY_S)
+
+
+
+
+def hilo_simulacion():
+    paso = 0
+    while True:
+        presion = 1013.25 - paso * 0.15 + np.random.normal(0, 0.4)
+        cola_datos.put({
+            "tiempo": datetime.now(),
+            "pkt": paso,
+            "temperatura_C": 22 + 2.5 * np.sin(paso / 20),
+            "presion_hPa": presion,
+            "altitud_m": 44330 * (1 - (presion / 1013.25) ** (1 / 5.255)),
+        })
+        estado_conexion["conectado"] = True
+        paso += 1
+        time.sleep(INTERVALO_MS / 1000)
+
+
+
+
+# -----------------------------------------------------------------------------
+# INTERFAZ
+# -----------------------------------------------------------------------------
+
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "axes.titleweight": "bold",
+    "axes.labelcolor": COLOR_SECUNDARIO,
+    "xtick.color": COLOR_SECUNDARIO,
+    "ytick.color": COLOR_SECUNDARIO,
+})
+
+
+fig = plt.figure(figsize=(14, 9.5), facecolor=COLOR_FONDO)
+layout = GridSpec(
+    3, 2, figure=fig, width_ratios=(3.8, 1.35),
+    height_ratios=(1, 1, 1), wspace=0.16, hspace=0.58,
+    left=0.06, right=0.97, bottom=0.24, top=0.87,
+)
+
+
+ax_temp = fig.add_subplot(layout[0, 0])
+ax_pres = fig.add_subplot(layout[1, 0], sharex=ax_temp)
+ax_alt_rel = fig.add_subplot(layout[2, 0], sharex=ax_temp)
+
+
+panel_layout = GridSpecFromSubplotSpec(
+    5, 1, subplot_spec=layout[:, 1],
+    height_ratios=(1.15, 0.72, 0.72, 0.72, 0.95), hspace=0.16,
+)
+ax_timer = fig.add_subplot(panel_layout[0])
+ax_temp_value = fig.add_subplot(panel_layout[1])
+ax_pres_value = fig.add_subplot(panel_layout[2])
+ax_alt_rel_value = fig.add_subplot(panel_layout[3])
+ax_status = fig.add_subplot(panel_layout[4])
+
+
+# Semaforo de estado en tiempo real.
+ax_semaforo = fig.add_axes([0.80, 0.895, 0.16, 0.055])
+ax_semaforo.set_facecolor(COLOR_PANEL)
+ax_semaforo.set_xlim(0, 1)
+ax_semaforo.set_ylim(0, 1)
+ax_semaforo.axis("off")
+semaforo_luz = ax_semaforo.add_patch(
+    Circle((0.14, 0.50), 0.22, facecolor=COLOR_ROJO, edgecolor="white", linewidth=1.2)
+)
+texto_semaforo = ax_semaforo.text(
+    0.34, 0.50, "SIN ENLACE", transform=ax_semaforo.transAxes,
+    color="white", fontsize=9, fontweight="bold", va="center"
+)
+
+
+fig.suptitle(
+    "Telemetría CanSat",
+    x=0.06, y=0.965, ha="left", fontsize=20,
+    color=COLOR_TEXTO, fontweight="bold",
+)
+texto_subtitulo = fig.text(
+    0.06, 0.925, "Estación terrena · esperando datos del BMP280",
+    ha="left", fontsize=10, color=COLOR_SECUNDARIO,
+)
+
+
+
+
+def preparar_grafico(axis, title, ylabel, color):
+    axis.set_facecolor("white")
+    axis.set_title(title, loc="left", fontsize=10, color=COLOR_TEXTO, pad=8)
+    axis.set_ylabel(ylabel, fontsize=9)
+    axis.grid(True, color="#E7EBF2", linewidth=0.8)
+    for spine in axis.spines.values():
+        spine.set_color(COLOR_BORDE)
+    line, = axis.plot(
+        [], [], color=color, linewidth=2.2,
+        marker="o", markersize=3, markerfacecolor=color,
+    )
+    return line
+
+
+
+
+linea_temp = preparar_grafico(ax_temp, "Temperatura BMP280", "°C", COLOR_ROJO)
+linea_pres = preparar_grafico(ax_pres, "Presión atmosférica", "hPa", COLOR_AZUL)
+linea_alt_rel = preparar_grafico(
+    ax_alt_rel, "Altura relativa al encendido del CanSat", "m", "#8E5BD9"
+)
+ax_alt_rel.set_xlabel("Hora local de recepción", fontsize=9)
+ax_alt_rel.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+
+
+
+
+def preparar_tarjeta(axis, titulo, color):
+    axis.set_facecolor("white")
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_color(COLOR_BORDE)
+        spine.set_linewidth(1.0)
+    axis.text(0.06, 0.76, titulo, transform=axis.transAxes,
+              fontsize=9, color=COLOR_SECUNDARIO, fontweight="bold")
+    return axis.text(0.06, 0.28, "--", transform=axis.transAxes,
+                     fontsize=18, color=color, fontweight="bold")
+
+
+
+
+for axis in (ax_timer, ax_status):
+    axis.set_facecolor(COLOR_PANEL)
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+
+
+ax_timer.text(0.06, 0.88, "TIEMPO DE SENSADO", transform=ax_timer.transAxes,
+              color="#AAB4C5", fontsize=8, fontweight="bold")
+texto_timer = ax_timer.text(
+    0.06, 0.64, "00:00:00", transform=ax_timer.transAxes,
+    color="white", fontsize=20, fontweight="bold",
+)
+ax_timer.text(0.06, 0.42, "TIEMPO DESDE DESPEGUE (+1 m)",
+              transform=ax_timer.transAxes, color="#AAB4C5",
+              fontsize=8, fontweight="bold")
+texto_despegue = ax_timer.text(
+    0.06, 0.14, "00:00:00", transform=ax_timer.transAxes,
+    color="#75BFFF", fontsize=20, fontweight="bold",
+)
+
+
+texto_temp = preparar_tarjeta(ax_temp_value, "TEMPERATURA", COLOR_ROJO)
+texto_pres = preparar_tarjeta(ax_pres_value, "PRESIÓN", COLOR_AZUL)
+texto_alt_rel = preparar_tarjeta(
+    ax_alt_rel_value, "ALTURA DESDE ENCENDIDO", "#8E5BD9"
+)
+
+
+texto_status = ax_status.text(
+    0.06, 0.50, "No se sensó nada\nhasta el momento",
+    transform=ax_status.transAxes, color="white", fontsize=10,
+    va="center", fontweight="bold",
+)
+
+
+
+
+def formato_tiempo(segundos):
+    segundos = max(0, int(segundos))
+    horas, resto = divmod(segundos, 3600)
+    minutos, segundos = divmod(resto, 60)
+    return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+
+
+
+
+def actualizar_semaforo():
+    """Actualiza el semaforo con el estado real de la conexion y la telemetria."""
+    ahora = time.monotonic()
+    ultimo = instante_ultimo_dato
+
+
+    if (
+        not estado_conexion["conectado"]
+        or ultimo is None
+        or ahora - ultimo > TIEMPO_SIN_TELEMETRIA_S
+    ):
+        color = COLOR_ROJO
+        etiqueta = "SIN TELEMETRIA"
+    elif (
+        ultimo_paquete_telemetria is not None
+        and ahora - ultimo_paquete_telemetria <= DURACION_PULSO_AZUL_S
+    ):
+        color = COLOR_AZUL
+        etiqueta = "TELEMETRIA"
+    else:
+        color = COLOR_VERDE
+        etiqueta = "OK"
+
+
+    semaforo_luz.set_facecolor(color)
+    texto_semaforo.set_text(etiqueta)
+
+
+
+
+def actualizar(_frame):
+    global altitud_inicial, ultimo_arranque, inicio_contador_local, inicio_despegue_local, ultimo_estado, instante_ultimo_dato, ultimo_paquete_telemetria
+    ultimo_dato = None
+    actualizar_semaforo()
+
+
+    while not cola_datos.empty():
+        dato = cola_datos.get()
+        if inicio_contador_local is None:
+            inicio_contador_local = time.monotonic()
+        if dato.get("arranque") != ultimo_arranque:
+            ultimo_arranque = dato.get("arranque")
+            altitud_inicial = None
+            inicio_despegue_local = None
+        if altitud_inicial is None:
+            altitud_inicial = dato["altitud_m"]
+            print(f"[Altitud] Referencia inicial: {altitud_inicial:.2f} m")
+
+
+        altitud_relativa = dato["altitud_m"] - altitud_inicial
+        if (
+            inicio_despegue_local is None
+            and altitud_relativa >= ALTITUD_DE_DESPEGUE_M
+        ):
+            inicio_despegue_local = time.monotonic()
+            print(
+                f"[Despegue] Altitud relativa alcanzó "
+                f"{ALTITUD_DE_DESPEGUE_M:.1f} m"
+            )
+        tiempos.append(dato["tiempo"])
+        temperaturas.append(dato["temperatura_C"])
+        presiones.append(dato["presion_hPa"])
+        altitud_mar = (ALTITUD_LUGAR_M + dato["altitud_m"]
+                       if ALTITUD_LUGAR_M is not None else float("nan"))
+        altitudes.append(altitud_mar)
+        altitudes_relativas.append(dato["altitud_m"])
+        registro = {**dato, "altitud_relativa_m": altitud_relativa,
+                    "altitud_nivel_mar_estimada_m": altitud_mar}
+        historico.append(registro)
+        guardar_registro_csv(registro)
+        ultimo_dato = dato
+        ultimo_estado = dato
+        instante_ultimo_dato = time.monotonic()
+        ultimo_paquete_telemetria = instante_ultimo_dato
+
+
+    if inicio_contador_local is None:
+        texto_timer.set_text("00:00:00")
+        texto_despegue.set_text("00:00:00")
+        texto_status.set_text("No se sensó nada\nhasta el momento")
+        texto_subtitulo.set_text(
+            "Estación terrena · conectada, esperando telemetría"
+            if estado_conexion["conectado"]
+            else "Estación terrena · sin conexión al receptor"
+        )
+        return linea_temp, linea_pres, linea_alt_rel
+
+
+    segundos = time.monotonic() - inicio_contador_local
+    texto_timer.set_text(formato_tiempo(segundos))
+    if inicio_despegue_local is None:
+        texto_despegue.set_text("00:00:00")
+        estado_despegue = "Esperando altitud relativa de 1 m"
+    else:
+        tiempo_despegue = time.monotonic() - inicio_despegue_local
+        texto_despegue.set_text(formato_tiempo(tiempo_despegue))
+        estado_despegue = "Despegue detectado"
+    estado = ultimo_estado or {}
+    texto_status.set_text(
+        ("SIN TELEMETRÍA RECIENTE\n" if time.monotonic() - instante_ultimo_dato > TIEMPO_SIN_TELEMETRIA_S else "") +
+        f"Paquete {estado.get('pkt', '--')}\n"
+        f"Vuelo: {'ARMADO' if estado.get('vuelo') == 1 else 'DESARMADO'}\n"
+        f"Servo: {'abierto' if estado.get('servo') == 1 else 'cerrado'}\n"
+        f"Buzzer: {'forzado' if estado.get('buzzer') == 1 else 'automático'}"
+    )
+    texto_temp.set_text(f"{temperaturas[-1]:.2f} °C")
+    texto_pres.set_text(f"{presiones[-1]:.2f} hPa")
+    texto_alt_rel.set_text(f"{altitudes_relativas[-1]:.2f} m")
+    texto_subtitulo.set_text("Estación terrena · sin telemetría reciente" if time.monotonic() - instante_ultimo_dato > TIEMPO_SIN_TELEMETRIA_S else "Estación terrena · recibiendo telemetría")
+
+
+    linea_temp.set_data(tiempos, temperaturas)
+    linea_pres.set_data(tiempos, presiones)
+    linea_alt_rel.set_data(tiempos, altitudes_relativas)
+    # Ajuste explícito de los ejes. Esto evita que el eje compartido deje
+    # invisible la curva de temperatura cuando llegan pocos puntos.
+    if tiempos:
+        inicio = mdates.date2num(tiempos[0])
+        fin = mdates.date2num(tiempos[-1])
+        margen_x = max((fin - inicio) * 0.04, 1 / 86400)
+        limite_x = (inicio - margen_x, fin + margen_x)
+
+
+        for axis, values in (
+            (ax_temp, temperaturas), (ax_pres, presiones),
+            (ax_alt_rel, altitudes_relativas),
+        ):
+            valores = np.asarray(values, dtype=float)
+            valores = valores[np.isfinite(valores)]
+            if not len(valores):
+                continue
+            minimo = float(np.min(valores))
+            maximo = float(np.max(valores))
+            margen_y = max((maximo - minimo) * 0.15, 0.05)
+            axis.set_xlim(limite_x)
+            axis.set_ylim(minimo - margen_y, maximo + margen_y)
+    return linea_temp, linea_pres, linea_alt_rel
+
+
+
+
+def formatear_registro_csv(registro):
+    registro_csv = dict(registro)
+    if isinstance(registro_csv.get("tiempo"), datetime):
+        registro_csv["tiempo"] = registro_csv["tiempo"].isoformat(
+            sep=" ", timespec="milliseconds"
+        )
+    return {columna: registro_csv.get(columna, "") for columna in COLUMNAS_CSV}
+
+
+
+
+def iniciar_csv():
+    try:
+        with open(ARCHIVO_CSV, "w", newline="", encoding="utf-8") as archivo:
+            csv.DictWriter(archivo, fieldnames=COLUMNAS_CSV).writeheader()
+        print(f"[CSV] Archivo iniciado: {os.path.abspath(ARCHIVO_CSV)}")
+    except OSError as error:
+        print(f"[CSV] No se pudo iniciar el archivo: {error}")
+
+
+
+
+def guardar_registro_csv(registro):
+    try:
+        with archivo_csv_lock, open(
+            ARCHIVO_CSV, "a", newline="", encoding="utf-8"
+        ) as archivo:
+            escritor = csv.DictWriter(archivo, fieldnames=COLUMNAS_CSV)
+            escritor.writerow(formatear_registro_csv(registro))
+            archivo.flush()
+            os.fsync(archivo.fileno())
+    except OSError as error:
+        print(f"[CSV] No se pudo guardar el registro: {error}")
+
+
+
+
+def guardar_historico():
+    if not historico:
+        print("[CSV] No hay registros para guardar")
+        return
+    temporal = None
+    try:
+        carpeta = os.path.dirname(os.path.abspath(ARCHIVO_CSV)) or "."
+        with archivo_csv_lock, tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", delete=False,
+            dir=carpeta, prefix="telemetria_", suffix=".tmp"
+        ) as archivo:
+            temporal = archivo.name
+            escritor = csv.DictWriter(archivo, fieldnames=COLUMNAS_CSV)
+            escritor.writeheader()
+            escritor.writerows(formatear_registro_csv(registro) for registro in historico)
+            archivo.flush()
+            os.fsync(archivo.fileno())
+        os.replace(temporal, ARCHIVO_CSV)
+        print(f"[CSV] Guardados {len(historico)} registros en {ARCHIVO_CSV}")
+    except OSError as error:
+        print(f"[CSV] No se pudo guardar el historial final: {error}")
+        if temporal and os.path.exists(temporal):
+            os.remove(temporal)
+
+
+
+
+
+
+# Controles transmiten al puerto de la estación terrena.
+controles = []
+def enviar_comando(comando):
+    with serial_lock:
+        if serial_activo is None or not serial_activo.is_open:
+            print("[Orden] Estación sin conexión")
+            return
+        try:
+            serial_activo.write(comando.encode("ascii"))
+            serial_activo.flush()
+            print(f"[Orden] Enviada: {comando}. Comprobar telemetría y ACK.")
+        except Exception as error:
+            print(f"[Orden] No se pudo enviar: {error}")
+
+
+def crear_boton(x, y, etiqueta, comando):
+    eje = fig.add_axes([x, y, 0.115, 0.035])
+    boton = Button(eje, etiqueta)
+    boton.on_clicked(lambda evento: enviar_comando(comando))
+    controles.append(boton)
+
+
+for x, etiqueta, comando in [(0.06, "Cerrar servo", "0"), (0.19, "Abrir servo", "1"),
+                              (0.32, "Buzzer ON", "b"), (0.45, "Buzzer auto", "B"),
+                              (0.58, "Armar vuelo", "F"), (0.71, "Desarmar", "D"),
+                              (0.84, "Reintentar", "R")]:
+    crear_boton(x, 0.085, etiqueta, comando)
+
+
+fig.text(0.06, 0.165, "Altitud conocida del lugar de encendido (m):", fontsize=9)
+eje_referencia = fig.add_axes([0.40, 0.155, 0.12, 0.035])
+entrada_referencia = TextBox(eje_referencia, "", initial="")
+def ajustar_referencia(valor):
+    global ALTITUD_LUGAR_M
+    try:
+        numero = float(valor.replace(",", "."))
+        if not np.isfinite(numero):
+            raise ValueError()
+        ALTITUD_LUGAR_M = numero
+        print(f"[Altitud] Referencia: {numero:.2f} m sobre el mar; se aplica a nuevas lecturas.")
+    except ValueError:
+        ALTITUD_LUGAR_M = None
+        print("[Altitud] Introducir un número válido y pulsar Enter.")
+entrada_referencia.on_submit(ajustar_referencia)
+fig.text(0.54, 0.165, "Ingresar valor y pulsar Enter", fontsize=8)
+fig.text(0.06, 0.035, "F/D: verificar estado de vuelo en la telemetría. Las órdenes dependen del enlace.", fontsize=8)
+
+
+if __name__ == "__main__":
+    iniciar_csv()
+    if MODO_DATOS == "serial":
+        hilo = threading.Thread(target=hilo_lectura_serial, daemon=True)
+    elif MODO_DATOS == "simulacion":
+        hilo = threading.Thread(target=hilo_simulacion, daemon=True)
+    else:
+        raise ValueError('MODO_DATOS debe ser "serial" o "simulacion"')
+
+
+    hilo.start()
+    animacion = FuncAnimation(
+        fig, actualizar, interval=INTERVALO_MS, cache_frame_data=False
+    )
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(f"[CSV] Datos guardados en {os.path.abspath(ARCHIVO_CSV)}")
+
+
+
+
+
