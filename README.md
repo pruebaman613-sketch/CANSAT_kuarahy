@@ -1,2 +1,7 @@
 # CANSAT_kuarahy
-no se
+integrantes:
+constansa mayr
+ambar torri
+isabella paulina ramos
+benjamin juarez
+
