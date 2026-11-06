@@ -1,0 +1,579 @@
+/*
+  CanSat - Heltec WiFi LoRa 32 V3 (ESP32-S3 / SX1262).
+  Dependencias: RadioLib 7.2.1, Adafruit BMP280 Library y ESP32Servo.
+  Monitor serie: 115200 baudios.
+
+
+  Cableado:
+  BMP280: SDA=41, SCL=42
+  Servo: PWM=5
+  Buzzer: GPIO4
+  LED RGB de anodo comun con terminal comun a 5 V:
+    Rojo: GPIO47
+    Verde: GPIO48
+    Azul: GPIO45
+  ESP32-CAM: TX de la Heltec a RX de la camara, GPIO7.
+
+
+  El LED RGB indica:
+    Rojo: error en radio, BMP280, datos o servo.
+    Azul: hubo comunicacion LoRa correcta durante los ultimos 5 segundos.
+    Verde: el sistema local funciona, pero no hubo comunicacion reciente.
+
+
+  Protocolo CSV V1, identificador de equipo 26. CRC LoRa habilitado.
+  T,1,equipo,arranque,paquete,bmpOK,temp,presion,altura,pico,servo,buzzer,auto
+  C,1,equipo,arranqueDestino,sesionBase,secuencia,servo,buzzer,modoVuelo
+  A,1,equipo,arranque,sesionBase,secuencia,servo,buzzer
+  H,1,equipo,arranque,paquete
+
+
+  Servo: 0=cerrar, 1=abrir.
+  Buzzer: 0=automatico, 1=forzar encendido.
+  No hay cifrado ni autenticacion criptografica.
+
+
+  Consola serie:
+    0: cerrar servo
+    1: abrir servo
+    b: forzar buzzer
+    B: buzzer automatico
+    F: rearmar vuelo si fue desarmado
+    D: desarmar vuelo
+*/
+
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>
+#include <Adafruit_BMP280.h>
+#include <ESP32Servo.h>
+#include <esp_system.h>
+#include <math.h>
+
+
+constexpr unsigned EQUIPO=26;
+constexpr bool ARMAR_AL_INICIO=true;
+constexpr uint32_t PERIODO_TX=1500;
+constexpr uint32_t VENTANA_RX=700;
+constexpr uint32_t TIEMPO_ENLACE_MS=5000;
+
+
+constexpr float PRESION_MAR=1013.25f;
+constexpr uint8_t PIN_SERVO=5;
+constexpr uint8_t PIN_BUZZER=4;
+
+
+// LED RGB de anodo comun: el terminal comun esta conectado a 5 V.
+constexpr uint8_t LED_R=47;
+constexpr uint8_t LED_G=48;
+constexpr uint8_t LED_B=45;
+
+
+constexpr int ANGULO_CERRADO=0;
+constexpr int ANGULO_ABIERTO=90;
+
+
+constexpr float ALTURA_ARMADO=10.0f;
+constexpr float CAIDA_APOGEO=2.0f;
+constexpr float ALTURA_RECUPERACION=5.0f;
+
+
+SX1262 radio=new Module(8,14,12,13);
+TwoWire busBMP(1);
+Adafruit_BMP280 bmp(&busBMP);
+Servo servo;
+HardwareSerial camara(1);
+
+
+volatile bool rxPendiente=false;
+bool radioOK=false;
+bool bmpOK=false;
+bool referenciaOK=false;
+bool datoOK=false;
+
+
+bool vueloArmado=ARMAR_AL_INICIO;
+bool apogeo=false;
+bool recuperacionArmada=false;
+bool servoAbierto=false;
+bool forzarBuzzer=false;
+bool salidaBuzzer=false;
+
+
+float temperatura=NAN;
+float presion=NAN;
+float altura=NAN;
+float pico=0;
+float presionInicial=0;
+
+
+uint8_t muestrasDescenso=0;
+uint8_t muestrasReferencia=0;
+float sumaPresion=0;
+
+
+uint32_t arranque=0;
+uint32_t paquete=0;
+uint32_t ultimaTX=0;
+uint32_t ultimaLectura=0;
+uint32_t ultimoIntentoBMP=0;
+uint32_t ultimoIntentoRadio=0;
+uint32_t finVentana=0;
+uint32_t ultimoEnlace=0;
+
+
+bool ventanaActiva=false;
+unsigned long ultimaSesion=0;
+unsigned long ultimaSecuencia=0;
+int ultimoServo=-1;
+int ultimoBuzzer=-1;
+int ultimoVuelo=-1;
+bool hayOrden=false;
+
+
+void IRAM_ATTR alRecibir() {
+  rxPendiente=true;
+}
+
+
+void apagarLED() {
+  digitalWrite(LED_R,HIGH);
+  digitalWrite(LED_G,HIGH);
+  digitalWrite(LED_B,HIGH);
+}
+
+
+void actualizarLED() {
+  bool error=!radioOK || !bmpOK || !datoOK || !servo.attached();
+  bool telemetriaActiva=ultimoEnlace!=0 &&
+    millis()-ultimoEnlace<TIEMPO_ENLACE_MS;
+
+
+  apagarLED();
+
+
+  // El rojo tiene prioridad ante cualquier falla.
+  if(error) {
+    digitalWrite(LED_R,LOW);
+  } else if(telemetriaActiva) {
+    digitalWrite(LED_B,LOW);
+  } else {
+    digitalWrite(LED_G,LOW);
+  }
+}
+
+
+void escuchar() {
+  rxPendiente=false;
+  radio.setDio1Action(alRecibir);
+  int estado=radio.startReceive();
+  if(estado!=RADIOLIB_ERR_NONE) {
+    Serial.printf("RX ERROR %d\n",estado);
+    radioOK=false;
+  }
+}
+
+
+bool enviar(String mensaje) {
+  // transmit() recibe una referencia String valida.
+  radio.clearDio1Action();
+  rxPendiente=false;
+
+
+  int estado=radio.transmit(mensaje);
+  escuchar();
+
+
+  if(estado!=RADIOLIB_ERR_NONE) {
+    Serial.printf("TX ERROR %d\n",estado);
+    return false;
+  }
+
+
+  ultimoEnlace=millis();
+  return true;
+}
+
+
+void iniciarRadio() {
+  ultimoIntentoRadio=millis();
+  radio.clearDio1Action();
+  SPI.begin(9,11,10,8);
+
+
+  int estado=radio.begin(915.0,125.0,7,5,0xF3,17,8,1.8);
+  if(estado==RADIOLIB_ERR_NONE) estado=radio.setCRC(true);
+
+
+  radioOK=estado==RADIOLIB_ERR_NONE;
+  Serial.printf("RADIO inicio: %d\n",estado);
+
+
+  if(radioOK) escuchar();
+}
+
+
+void moverServo(bool abrir) {
+  servoAbierto=abrir;
+  servo.write(abrir ? ANGULO_ABIERTO : ANGULO_CERRADO);
+  camara.write(abrir ? '1' : '0');
+  Serial.printf("SERVO orden=%d CAMARA UART=%d\n",abrir,abrir);
+}
+
+
+void iniciarBMP() {
+  ultimoIntentoBMP=millis();
+  bmpOK=bmp.begin(0x76) || bmp.begin(0x77);
+
+
+  if(bmpOK) {
+    bmp.setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,
+      Adafruit_BMP280::SAMPLING_X16,
+      Adafruit_BMP280::FILTER_X16,
+      Adafruit_BMP280::STANDBY_MS_125
+    );
+  }
+
+
+  Serial.println(bmpOK
+    ? "BMP detectado; calibrando en reposo"
+    : "BMP AUSENTE: radio y servo siguen disponibles");
+}
+
+
+void leerSensor() {
+  ultimaLectura=millis();
+
+
+  if(!bmpOK) {
+    datoOK=false;
+    return;
+  }
+
+
+  temperatura=bmp.readTemperature();
+  presion=bmp.readPressure()/100.0f;
+
+
+  datoOK=isfinite(temperatura) && isfinite(presion) &&
+    temperatura>=-40 && temperatura<=85 &&
+    presion>=300 && presion<=1100;
+
+
+  if(!datoOK) {
+    Serial.println("BMP lectura invalida");
+    bmpOK=false;
+    return;
+  }
+
+
+  // Promedia 20 lecturas separadas 200 ms sin bloquear la radio.
+  if(!referenciaOK) {
+    sumaPresion+=presion;
+    muestrasReferencia++;
+
+
+    if(muestrasReferencia>=20) {
+      presionInicial=sumaPresion/muestrasReferencia;
+      referenciaOK=true;
+      altura=0;
+      Serial.printf("REFERENCIA LISTA %.2f hPa\n",presionInicial);
+    }
+    return;
+  }
+
+
+  // Altura relativa respecto de la presion inicial.
+  float nueva=44330.0f*
+    (1.0f-powf(presion/presionInicial,0.19029495f));
+  altura=0.75f*altura+0.25f*nueva;
+
+
+  if(!vueloArmado) return;
+
+
+  if(altura>pico) pico=altura;
+  if(pico>=ALTURA_ARMADO) recuperacionArmada=true;
+
+
+  // Cinco muestras consecutivas por debajo del pico menos 2 metros.
+  if(!apogeo && recuperacionArmada) {
+    if(pico-altura>=CAIDA_APOGEO) muestrasDescenso++;
+    else muestrasDescenso=0;
+
+
+    if(muestrasDescenso>=5) {
+      apogeo=true;
+      moverServo(true);
+      Serial.println("APOGEO: apertura automatica ejecutada");
+    }
+  }
+}
+
+
+void actualizarBuzzer() {
+  bool automatico=vueloArmado && datoOK && referenciaOK &&
+    recuperacionArmada && altura<=ALTURA_RECUPERACION;
+
+
+  salidaBuzzer=forzarBuzzer || (automatico && millis()%1000<150);
+  digitalWrite(PIN_BUZZER,salidaBuzzer);
+}
+
+
+void recibirOrden() {
+  rxPendiente=false;
+  String mensaje;
+  int estado=radio.readData(mensaje);
+  escuchar();
+
+
+  if(estado!=RADIOLIB_ERR_NONE) {
+    Serial.printf("RX ERROR %d\n",estado);
+    return;
+  }
+
+
+  // Hubo una recepcion LoRa valida.
+  ultimoEnlace=millis();
+
+
+  unsigned version,id;
+  unsigned long destino,sesion,secuencia;
+  int abrir,buzzer,ordenVuelo,n=0;
+  unsigned long recibido;
+
+
+  int acuse=sscanf(mensaje.c_str(),"H,%u,%u,%lu,%lu%n",
+    &version,&id,&destino,&recibido,&n);
+
+
+  if(acuse==4 && n==(int)mensaje.length() &&
+     version==1 && id==EQUIPO && destino==arranque &&
+     recibido==paquete) {
+    Serial.printf("BASE CONFIRMA TELEMETRIA #%lu\n",recibido);
+    return;
+  }
+
+
+  n=0;
+  int campos=sscanf(mensaje.c_str(),
+    "C,%u,%u,%lu,%lu,%lu,%d,%d,%d%n",
+    &version,&id,&destino,&sesion,&secuencia,
+    &abrir,&buzzer,&ordenVuelo,&n);
+
+
+  if(campos!=8 || n!=(int)mensaje.length() ||
+     version!=1 || id!=EQUIPO || destino!=arranque ||
+     (abrir!=0 && abrir!=1) ||
+     (buzzer!=0 && buzzer!=1) ||
+     (ordenVuelo<-1 || ordenVuelo>1)) return;
+
+
+  bool duplicada=hayOrden &&
+    sesion==ultimaSesion && secuencia==ultimaSecuencia;
+
+
+  if(hayOrden && sesion==ultimaSesion && secuencia<ultimaSecuencia) return;
+
+
+  if(duplicada &&
+     (abrir!=ultimoServo || buzzer!=ultimoBuzzer ||
+      ordenVuelo!=ultimoVuelo)) return;
+
+
+  if(!duplicada) {
+    // Los reintentos de la misma orden no deshacen una apertura por apogeo.
+    moverServo(abrir);
+    forzarBuzzer=buzzer;
+
+
+    if(ordenVuelo==1 && referenciaOK && datoOK && !vueloArmado) {
+      vueloArmado=true;
+      pico=altura;
+      muestrasDescenso=0;
+      apogeo=false;
+      recuperacionArmada=false;
+      Serial.println("VUELO ARMADO");
+    } else if(ordenVuelo==0) {
+      vueloArmado=false;
+      Serial.println("VUELO DESARMADO");
+    } else if(ordenVuelo==1 && !vueloArmado) {
+      Serial.println("NO ARMADO: sensor o referencia no disponibles");
+    }
+
+
+    ultimaSesion=sesion;
+    ultimaSecuencia=secuencia;
+    ultimoServo=abrir;
+    ultimoBuzzer=buzzer;
+    ultimoVuelo=ordenVuelo;
+    hayOrden=true;
+  }
+
+
+  char respuesta[120];
+  snprintf(respuesta,sizeof(respuesta),
+    "A,1,%u,%lu,%lu,%lu,%d,%d",
+    EQUIPO,
+    (unsigned long)arranque,
+    sesion,
+    secuencia,
+    servoAbierto,
+    forzarBuzzer);
+
+
+  enviar(String(respuesta));
+  Serial.printf("ACK secuencia=%lu duplicada=%d\n",secuencia,duplicada);
+}
+
+
+void telemetria() {
+  char mensaje[200];
+
+
+  snprintf(mensaje,sizeof(mensaje),
+    "T,1,%u,%lu,%lu,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%d",
+    EQUIPO,
+    (unsigned long)arranque,
+    (unsigned long)++paquete,
+    datoOK && referenciaOK,
+    temperatura,
+    presion,
+    altura,
+    pico,
+    servoAbierto,
+    forzarBuzzer,
+    vueloArmado);
+
+
+  enviar(String(mensaje));
+  Serial.println(mensaje);
+
+
+  ultimaTX=millis();
+  finVentana=ultimaTX+VENTANA_RX;
+  ventanaActiva=true;
+}
+
+
+void consola() {
+  while(Serial.available()) {
+    char c=Serial.read();
+
+
+    if(c=='0' || c=='1') moverServo(c=='1');
+    if(c=='b') forzarBuzzer=true;
+    if(c=='B') forzarBuzzer=false;
+
+
+    if(c=='F' && referenciaOK && datoOK && !vueloArmado) {
+      vueloArmado=true;
+      pico=altura;
+      muestrasDescenso=0;
+      apogeo=false;
+      recuperacionArmada=false;
+      Serial.println("VUELO ARMADO");
+    }
+
+
+    if(c=='D') {
+      vueloArmado=false;
+      Serial.println("VUELO DESARMADO");
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+
+  arranque=esp_random();
+
+
+  pinMode(LED_R,OUTPUT);
+  pinMode(LED_G,OUTPUT);
+  pinMode(LED_B,OUTPUT);
+  apagarLED();
+
+
+  pinMode(PIN_BUZZER,OUTPUT);
+  digitalWrite(PIN_BUZZER,LOW);
+
+
+  camara.begin(115200,SERIAL_8N1,-1,7);
+
+
+  servo.setPeriodHertz(50);
+  servo.attach(PIN_SERVO,500,2400);
+  Serial.println(servo.attached()
+    ? "SERVO PWM conectado"
+    : "ERROR: servo sin PWM");
+
+
+  moverServo(false);
+
+
+  busBMP.begin(41,42);
+  busBMP.setTimeOut(50);
+
+
+  iniciarRadio();
+  iniciarBMP();
+
+
+  Serial.println(
+    "LISTO: 0/1 servo, b/B buzzer, F armar, D desarmar");
+}
+
+
+void loop() {
+  consola();
+
+
+  // Repite el estado UART para que la camara pueda arrancar despues.
+  static uint32_t ultimaCamara=0;
+  if(millis()-ultimaCamara>=2000) {
+    ultimaCamara=millis();
+    camara.write(servoAbierto ? '1' : '0');
+  }
+
+
+  if(radioOK && rxPendiente) recibirOrden();
+
+
+  uint32_t ahora=millis();
+
+
+  if(ahora-ultimaLectura>=200) leerSensor();
+
+
+  actualizarBuzzer();
+
+
+  if(!bmpOK && ahora-ultimoIntentoBMP>=5000) iniciarBMP();
+  if(!radioOK && ahora-ultimoIntentoRadio>=5000) iniciarRadio();
+
+
+  if(ventanaActiva && (int32_t)(ahora-finVentana)>=0) {
+    ventanaActiva=false;
+  }
+
+
+  if(radioOK && !ventanaActiva && ahora-ultimaTX>=PERIODO_TX) {
+    telemetria();
+  }
+
+
+  actualizarLED();
+  delay(1);
+}
+
+
+
